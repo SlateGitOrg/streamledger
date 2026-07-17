@@ -1,0 +1,23 @@
+# Build output — anchored to the repo root so this never shadows a
+# source directory of the same name (e.g. cmd/streamledger).
+/bin/
+/streamledger
+*.exe
+*.test
+
+# Go tooling
+*.out
+coverage.out
+coverage.html
+
+# Vendoring (only relevant if `go mod vendor` is ever run locally)
+vendor/
+
+# Local env / secrets
+.env
+.env.*
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/

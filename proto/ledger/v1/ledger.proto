@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+option go_package = "streamledger/gen/ledger/v1;ledgerv1";
+
+// LedgerService exposes the command (write) and query (read) API for the
+// event-sourced ledger. Commands append events to the durable log and are
+// idempotent via dedupe_key. Queries read from the CQRS materialized
+// projections, which are eventually consistent with the event log.
+service LedgerService {
+  // Account (balance) commands.
+  rpc OpenAccount(OpenAccountRequest) returns (CommandResponse);
+  rpc Deposit(DepositRequest) returns (CommandResponse);
+  rpc Withdraw(WithdrawRequest) returns (CommandResponse);
+  rpc Transfer(TransferRequest) returns (CommandResponse);
+
+  // Inventory commands.
+  rpc AdjustInventory(AdjustInventoryRequest) returns (CommandResponse);
+  rpc ReserveStock(ReserveStockRequest) returns (CommandResponse);
+  rpc ReleaseStock(ReleaseStockRequest) returns (CommandResponse);
+
+  // Queries against the CQRS read models.
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc GetInventory(GetInventoryRequest) returns (GetInventoryResponse);
+  rpc GetProjectionLag(GetProjectionLagRequest) returns (GetProjectionLagResponse);
+}
+
+// expected_version semantics used by every mutating command:
+//   -1  -> no optimistic concurrency check (last-writer-wins on this stream)
+//    0  -> the stream must not exist yet (first event)
+//    N  -> the stream must currently be at version N
+message OpenAccountRequest {
+  string account_id = 1;
+  int64 initial_balance_cents = 2;
+  string dedupe_key = 3;
+}
+
+message DepositRequest {
+  string account_id = 1;
+  int64 amount_cents = 2;
+  string dedupe_key = 3;
+  int64 expected_version = 4;
+}
+
+message WithdrawRequest {
+  string account_id = 1;
+  int64 amount_cents = 2;
+  string dedupe_key = 3;
+  int64 expected_version = 4;
+}
+
+message TransferRequest {
+  string from_account_id = 1;
+  string to_account_id = 2;
+  int64 amount_cents = 3;
+  string dedupe_key = 4;
+}
+
+message AdjustInventoryRequest {
+  string item_id = 1;
+  int64 delta_quantity = 2;
+  string reason = 3;
+  string dedupe_key = 4;
+}
+
+message ReserveStockRequest {
+  string item_id = 1;
+  int64 quantity = 2;
+  string order_id = 3;
+  string dedupe_key = 4;
+}
+
+message ReleaseStockRequest {
+  string item_id = 1;
+  int64 quantity = 2;
+  string order_id = 3;
+  string dedupe_key = 4;
+}
+
+message CommandResponse {
+  // true if this call caused new events to be appended.
+  bool applied = 1;
+  // true if dedupe_key had already been processed; the response reflects
+  // the cached outcome of the original request rather than a new mutation.
+  bool duplicate = 2;
+  // resulting version of the primary stream after the command.
+  int64 new_version = 3;
+  string message = 4;
+}
+
+message GetBalanceRequest {
+  string account_id = 1;
+}
+
+message GetBalanceResponse {
+  string account_id = 1;
+  bool found = 2;
+  int64 balance_cents = 3;
+  int64 version = 4;
+  int64 updated_at_unix_ms = 5;
+}
+
+message GetInventoryRequest {
+  string item_id = 1;
+}
+
+message GetInventoryResponse {
+  string item_id = 1;
+  bool found = 2;
+  int64 available_quantity = 3;
+  int64 reserved_quantity = 4;
+  int64 version = 5;
+  int64 updated_at_unix_ms = 6;
+}
+
+message GetProjectionLagRequest {}
+
+message ProjectionLag {
+  string projection_name = 1;
+  int64 latest_global_seq = 2;
+  int64 applied_global_seq = 3;
+  int64 lag = 4;
+}
+
+message GetProjectionLagResponse {
+  repeated ProjectionLag lags = 1;
+}
