@@ -7,22 +7,22 @@ An event-sourced, CQRS-projected ledger service (Go, gRPC) for balances and inve
 
 ## Why
 
-Fintech and marketplace backends live and die by one property: **the ledger must be right, even when a thousand requests hit the same account at once.** The naive approach — `SELECT balance ... ; UPDATE balance = balance - amount` — is a textbook race condition. Two concurrent withdrawals can both read the same balance, both decide there's enough money, and both commit: a double-spend. Retrying a timed-out payment can silently double-charge a customer. And when something *does* go wrong, "what actually happened to this account" is only ever a lossy `UPDATE` log away, if it's logged at all.
+A ledger has to stay correct when many requests hit the same account at once. The naive `SELECT balance ...; UPDATE balance = balance - amount` is a race: two concurrent withdrawals can both read the same balance, both pass the check, and both commit, which is a double-spend. Retrying a timed-out payment can double-charge. A plain `UPDATE` also leaves no record of what happened to the account.
 
-StreamLedger solves this with three techniques used in production financial systems, wired together end to end:
+StreamLedger addresses this with three techniques:
 
-- **Event sourcing** — every state change is an immutable, append-only event. The current balance is never stored directly; it's *derived* by replaying events. Nothing is ever lost or overwritten.
-- **Optimistic concurrency** — every append is a compare-and-swap against the stream's version. Two concurrent writers racing the same account can't both win; the loser retries against fresh state (or fails fast, caller's choice).
-- **Idempotent consumers via dedupe keys** — every command carries an optional `dedupe_key`. Retried commands (client timeouts, at-least-once message buses, `curl` scripts run twice) replay the *original* result instead of re-applying the effect.
+- **Event sourcing**: every state change is an immutable, append-only event. The balance is never stored directly; it is derived by replaying events.
+- **Optimistic concurrency**: every append is a compare-and-swap against the stream version. Of two writers racing on one account, one wins and the other retries against fresh state (or fails fast, caller's choice).
+- **Idempotent consumers via dedupe keys**: a command may carry a `dedupe_key`. A retried command (client timeout, at-least-once bus, a script run twice) replays the original result instead of re-applying the effect.
 
-## Honesty about the guarantee: effectively-once, not exactly-once
+## Delivery guarantee: effectively-once
 
-No distributed system delivers a message exactly once — that's a marketing term, not an engineering one. What StreamLedger actually guarantees is **effectively-once processing**: delivery is *at-least-once* (the event bus, and any real broker, will occasionally redeliver), but every consumer is *idempotent*, so redelivery is a safe no-op. Two independent mechanisms provide this:
+Delivery is at-least-once: the bus can redeliver. Consumers are idempotent, so a redelivery is a no-op. Two mechanisms provide this:
 
-1. **Command-side dedupe.** `dedupe_key` is checked against the event log before any business rule is evaluated. A retried `Deposit` call with the same key never appends a second event — it returns the cached result of the first.
-2. **Projection-side checkpoints.** Every CQRS read-model projection tracks the highest event sequence number it has applied. An event redelivered by the bus (or reprocessed by an overlapping catch-up poll) is recognized as already-seen and skipped — proven under concurrent redelivery in `internal/projections/projector_test.go`.
+1. **Command-side dedupe.** `dedupe_key` is checked against the event log before any business rule runs. A retried `Deposit` with the same key appends no second event and returns the cached result of the first.
+2. **Projection-side checkpoints.** Each projection tracks the highest event sequence number it has applied and skips anything at or below it, whether the duplicate came from the bus or an overlapping catch-up poll. `internal/projections/projector_test.go` exercises concurrent redelivery.
 
-The event log is always the durable source of truth; the message bus is a best-effort low-latency notification on top of it. If every bus message were lost, a projection's periodic catch-up poll against the log would still converge it to correct state. That's what "effectively-once" buys you: correctness that doesn't depend on the broker behaving.
+The event log is the source of truth; the bus is a best-effort, low-latency notification on top of it. If every bus message were lost, a projection's periodic catch-up poll against the log would still converge it.
 
 ## Features
 
@@ -45,7 +45,7 @@ flowchart LR
         Svc -->|3: append with<br/>expected_version| Store
     end
 
-    Store -->|best-effort publish| Bus[[Event Bus<br/>Kafka / NATS JetStream]]
+    Store -->|best-effort publish| Bus[[Event Bus<br/>in-memory / NATS JetStream]]
     Store -->|catch-up poll,<br/>the durability backstop| Proj
 
     subgraph Read["Read path (CQRS projections)"]
@@ -72,7 +72,7 @@ Prerequisites: Go 1.25+. No Docker, no database, no message broker needed to bui
 git clone https://github.com/SlateGitOrg/streamledger.git
 cd streamledger
 go build ./...
-go test -race -count=1 ./...   # 48 tests, everything in-memory, a few seconds
+go test -race -count=1 ./...   # everything in-memory, a few seconds
 
 # Run the service entirely in-process (in-memory log + read models + bus):
 go run ./cmd/streamledger
@@ -86,6 +86,17 @@ go run ./cmd/streamledger \
   -storage=postgres -database-url="postgres://user:pass@host/db" \
   -bus=nats -nats-url="nats://host:4222"
 ```
+
+### Docker
+
+The image runs the in-memory configuration by default:
+
+```bash
+docker build -t streamledger .
+docker run --rm -p 9090:9090 -p 9091:9091 streamledger
+```
+
+Pass the same flags as above (for example `-storage=postgres -database-url=...`) after the image name to use real infrastructure.
 
 ### Usage
 
@@ -113,9 +124,9 @@ Output captured from a local run (trimmed). Repeating the same `Deposit` with `r
 
 ## Testing
 
-Every test in the default suite (`go test ./...`) runs against in-memory fakes (`internal/eventstore/memory`, `internal/projections/memory`, `internal/bus/inmemory`) — no Docker daemon, no live Postgres, no live Kafka/NATS, no network. That's a deliberate constraint, not a shortcut: it means the properties under test are properties of the *code* (retry logic, checkpoint math, decide functions), not of infrastructure that happened to be up when the test ran. The table-driven suite specifically proves:
+Every test in the default suite (`go test ./...`) runs against in-memory fakes (`internal/eventstore/memory`, `internal/projections/memory`, `internal/bus/inmemory`) — no Docker daemon, no live Postgres, no live NATS, no network. That's a deliberate constraint, not a shortcut: it means the properties under test are properties of the *code* (retry logic, checkpoint math, decide functions), not of infrastructure that happened to be up when the test ran. The table-driven suite specifically proves:
 
-- **Idempotent apply**: injecting the same event multiple times (including concurrently, via `t.Run`-style goroutine fan-out) never double-applies a projection (`internal/projections/projector_test.go`).
+- **Idempotent apply**: injecting the same event multiple times (including concurrently, using plain goroutines and a `sync.WaitGroup`) never double-applies a projection (`internal/projections/projector_test.go`).
 - **Optimistic-concurrency conflicts**: a stale `expected_version` is rejected (`ErrVersionConflict`), and 30 goroutines racing withdrawals against a single account converge to *exactly* the correct number of successes with a final balance of zero — never negative (`internal/ledger/service_test.go`).
 - **Projection correctness**: the CQRS read model, rebuilt purely from the event log, matches a direct fold of that same log bit-for-bit.
 - **Command-level dedupe**: a retried command (including concurrently, simulating a racing at-least-once bus) appends exactly one event, not `N`.
@@ -140,7 +151,7 @@ proto/, gen/             the LedgerService API definition and its generated Go b
 
 - **Snapshots**: long-lived streams currently replay from the beginning on every command. A snapshot-every-N-events strategy would bound replay cost; the `Store` interface already has the seam for it (`LoadStream` could take an `afterVersion` cursor).
 - **Outbox pattern for the bus publish**: today's "durable log write, then best-effort bus publish" is correct (catch-up polling is the backstop) but means a lost publish costs up to `catchUpPollInterval` of added latency, not correctness. A transactional outbox row updated in the same Postgres transaction as the event insert would tighten that further.
-- **Multi-writer horizontal scaling of projections**: the checkpoint-inside-a-transaction design already makes concurrent `ApplyEvent` calls safe (proven under goroutine fan-out in tests), which is what makes running multiple projector replicas for the same projection name safe too — untested at replica-count-greater-than-one scale, but the correctness argument holds by construction.
+- **Multiple projector replicas**: checkpoint check and view update run in one `WithTx` call, and concurrent `ApplyEvent` calls on one projector are tested. Running several projector replicas for the same projection has not been tested, so treat it as unverified.
 
 ## License
 
